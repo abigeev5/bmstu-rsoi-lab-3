@@ -2,8 +2,10 @@
 
 #include <chrono>
 #include <memory>
+#include <string_view>
 #include <utility>
 
+#include <userver/clients/http/error.hpp>
 #include <userver/clients/http/request.hpp>
 #include <userver/clients/http/response.hpp>
 #include <userver/formats/json/serialize.hpp>
@@ -11,6 +13,7 @@
 #include <userver/formats/parse/common_containers.hpp>
 #include <userver/formats/serialize/common_containers.hpp>
 #include <userver/http/common_headers.hpp>
+#include <userver/logging/log.hpp>
 
 #include "common/http.hpp"
 
@@ -22,10 +25,21 @@ using userver::clients::http::HttpMethod;
 using userver::clients::http::Response;
 using userver::formats::json::Value;
 
+// After this many failed requests in a row the breaker opens...
+constexpr int kFailureThreshold = 3;
+// ...and lets a trial request through after this time.
+constexpr std::chrono::seconds kOpenDuration{10};
+
+constexpr std::string_view kReservation = "Reservation";
+constexpr std::string_view kPayment = "Payment";
+constexpr std::string_view kLoyalty = "Loyalty";
+
+// Sends a request through the service's circuit breaker. No answer, 5xx or an open breaker
+// end in ServiceUnavailable; any other response (4xx too) is returned to the caller.
 std::shared_ptr<Response> Perform(userver::clients::http::Client& http,
-                                  std::chrono::milliseconds timeout, HttpMethod method,
-                                  std::string url, const std::string& username = {},
-                                  std::string body = {}) {
+                                  std::chrono::milliseconds timeout, CircuitBreaker& breaker,
+                                  std::string_view service, HttpMethod method, std::string url,
+                                  const std::string& username = {}, std::string body = {}) {
     userver::clients::http::Headers headers;
     if (!username.empty()) {
         headers.insert_or_assign(std::string{rsoi::kUserNameHeader}, username);
@@ -38,7 +52,26 @@ std::shared_ptr<Response> Perform(userver::clients::http::Client& http,
     if (!body.empty()) {
         request.data(std::move(body));
     }
-    return request.perform();
+
+    if (!breaker.AllowRequest()) {
+        throw ServiceUnavailable(service);
+    }
+    std::shared_ptr<Response> response;
+    try {
+        response = request.perform();
+    } catch (const userver::clients::http::BaseException& e) {
+        LOG_WARNING() << service << " Service request failed: " << e.what();
+        breaker.RecordFailure();
+        throw ServiceUnavailable(service);
+    }
+    const auto status = static_cast<int>(response->status_code());
+    if (status >= 500) {
+        LOG_WARNING() << service << " Service answered " << status;
+        breaker.RecordFailure();
+        throw ServiceUnavailable(service);
+    }
+    breaker.RecordSuccess();
+    return response;
 }
 
 bool IsNotFound(const Response& response) {
@@ -95,17 +128,18 @@ Loyalty ParseLoyalty(const Value& json) {
 
 ReservationClient::ReservationClient(userver::clients::http::Client& http, std::string base_url,
                                      std::chrono::milliseconds timeout)
-    : http_(http), base_url_(std::move(base_url)), timeout_(timeout) {}
+    : http_(http), base_url_(std::move(base_url)), timeout_(timeout),
+      breaker_(kFailureThreshold, kOpenDuration) {}
 
 Value ReservationClient::ListHotels(int page, int size) const {
     const auto url =
         base_url_ + "/api/v1/hotels?page=" + std::to_string(page) + "&size=" + std::to_string(size);
-    return JsonBody(*Perform(http_, timeout_, HttpMethod::kGet, url));
+    return JsonBody(*Perform(http_, timeout_, breaker_, kReservation, HttpMethod::kGet, url));
 }
 
 std::optional<Hotel> ReservationClient::GetHotel(const std::string& hotel_uid) const {
-    const auto response =
-        Perform(http_, timeout_, HttpMethod::kGet, base_url_ + "/api/v1/hotels/" + hotel_uid);
+    const auto response = Perform(http_, timeout_, breaker_, kReservation, HttpMethod::kGet,
+                                  base_url_ + "/api/v1/hotels/" + hotel_uid);
     if (IsNotFound(*response)) {
         return std::nullopt;
     }
@@ -113,8 +147,8 @@ std::optional<Hotel> ReservationClient::GetHotel(const std::string& hotel_uid) c
 }
 
 std::vector<Reservation> ReservationClient::GetReservations(const std::string& username) const {
-    const auto json = JsonBody(
-        *Perform(http_, timeout_, HttpMethod::kGet, base_url_ + "/api/v1/reservations", username));
+    const auto json = JsonBody(*Perform(http_, timeout_, breaker_, kReservation, HttpMethod::kGet,
+                                        base_url_ + "/api/v1/reservations", username));
     std::vector<Reservation> reservations;
     for (const auto& item : json) {
         reservations.push_back(ParseReservation(item));
@@ -125,7 +159,7 @@ std::vector<Reservation> ReservationClient::GetReservations(const std::string& u
 std::optional<Reservation>
 ReservationClient::GetReservation(const std::string& username,
                                   const std::string& reservation_uid) const {
-    const auto response = Perform(http_, timeout_, HttpMethod::kGet,
+    const auto response = Perform(http_, timeout_, breaker_, kReservation, HttpMethod::kGet,
                                   base_url_ + "/api/v1/reservations/" + reservation_uid, username);
     if (IsNotFound(*response)) {
         return std::nullopt;
@@ -140,35 +174,36 @@ Reservation ReservationClient::CreateReservation(const std::string& username,
     body["startDate"] = reservation.start_date;
     body["endDate"] = reservation.end_date;
     body["paymentUid"] = reservation.payment_uid;
-    const auto response =
-        Perform(http_, timeout_, HttpMethod::kPost, base_url_ + "/api/v1/reservations", username,
-                userver::formats::json::ToString(body.ExtractValue()));
+    const auto response = Perform(http_, timeout_, breaker_, kReservation, HttpMethod::kPost,
+                                  base_url_ + "/api/v1/reservations", username,
+                                  userver::formats::json::ToString(body.ExtractValue()));
     return ParseReservation(JsonBody(*response));
 }
 
 void ReservationClient::CancelReservation(const std::string& username,
                                           const std::string& reservation_uid) const {
-    Perform(http_, timeout_, HttpMethod::kDelete,
+    Perform(http_, timeout_, breaker_, kReservation, HttpMethod::kDelete,
             base_url_ + "/api/v1/reservations/" + reservation_uid, username)
         ->raise_for_status();
 }
 
 PaymentClient::PaymentClient(userver::clients::http::Client& http, std::string base_url,
                              std::chrono::milliseconds timeout)
-    : http_(http), base_url_(std::move(base_url)), timeout_(timeout) {}
+    : http_(http), base_url_(std::move(base_url)), timeout_(timeout),
+      breaker_(kFailureThreshold, kOpenDuration) {}
 
 Payment PaymentClient::CreatePayment(std::int64_t price) const {
     userver::formats::json::ValueBuilder body;
     body["price"] = price;
-    const auto response =
-        Perform(http_, timeout_, HttpMethod::kPost, base_url_ + "/api/v1/payments", {},
-                userver::formats::json::ToString(body.ExtractValue()));
+    const auto response = Perform(http_, timeout_, breaker_, kPayment, HttpMethod::kPost,
+                                  base_url_ + "/api/v1/payments", {},
+                                  userver::formats::json::ToString(body.ExtractValue()));
     return ParsePayment(JsonBody(*response));
 }
 
 std::optional<Payment> PaymentClient::GetPayment(const std::string& payment_uid) const {
-    const auto response =
-        Perform(http_, timeout_, HttpMethod::kGet, base_url_ + "/api/v1/payments/" + payment_uid);
+    const auto response = Perform(http_, timeout_, breaker_, kPayment, HttpMethod::kGet,
+                                  base_url_ + "/api/v1/payments/" + payment_uid);
     if (IsNotFound(*response)) {
         return std::nullopt;
     }
@@ -176,26 +211,30 @@ std::optional<Payment> PaymentClient::GetPayment(const std::string& payment_uid)
 }
 
 void PaymentClient::CancelPayment(const std::string& payment_uid) const {
-    Perform(http_, timeout_, HttpMethod::kDelete, base_url_ + "/api/v1/payments/" + payment_uid)
+    Perform(http_, timeout_, breaker_, kPayment, HttpMethod::kDelete,
+            base_url_ + "/api/v1/payments/" + payment_uid)
         ->raise_for_status();
 }
 
 LoyaltyClient::LoyaltyClient(userver::clients::http::Client& http, std::string base_url,
                              std::chrono::milliseconds timeout)
-    : http_(http), base_url_(std::move(base_url)), timeout_(timeout) {}
+    : http_(http), base_url_(std::move(base_url)), timeout_(timeout),
+      breaker_(kFailureThreshold, kOpenDuration) {}
 
 Loyalty LoyaltyClient::GetLoyalty(const std::string& username) const {
-    return ParseLoyalty(JsonBody(
-        *Perform(http_, timeout_, HttpMethod::kGet, base_url_ + "/api/v1/loyalty", username)));
+    return ParseLoyalty(JsonBody(*Perform(http_, timeout_, breaker_, kLoyalty, HttpMethod::kGet,
+                                          base_url_ + "/api/v1/loyalty", username)));
 }
 
 void LoyaltyClient::Increment(const std::string& username) const {
-    Perform(http_, timeout_, HttpMethod::kPost, base_url_ + "/api/v1/loyalty/increment", username)
+    Perform(http_, timeout_, breaker_, kLoyalty, HttpMethod::kPost,
+            base_url_ + "/api/v1/loyalty/increment", username)
         ->raise_for_status();
 }
 
 void LoyaltyClient::Decrement(const std::string& username) const {
-    Perform(http_, timeout_, HttpMethod::kPost, base_url_ + "/api/v1/loyalty/decrement", username)
+    Perform(http_, timeout_, breaker_, kLoyalty, HttpMethod::kPost,
+            base_url_ + "/api/v1/loyalty/decrement", username)
         ->raise_for_status();
 }
 

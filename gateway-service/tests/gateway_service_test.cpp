@@ -1,5 +1,6 @@
 #include <chrono>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -17,10 +18,18 @@ constexpr std::string_view kReservationUid = "9b4ba1f7-e5ac-465b-ace4-7b54dec20f
 constexpr std::string_view kPaymentUid = "5c4a6c2a-6d3c-4b8a-9d0e-0b1f3c2d4e5f";
 
 using CallLog = std::vector<std::string>;
+// Client methods that the test makes fail with ServiceUnavailable.
+using Failing = std::set<std::string>;
+
+void ThrowIfFailing(const Failing& failing, const std::string& method, std::string_view service) {
+    if (failing.contains(method)) {
+        throw ServiceUnavailable(service);
+    }
+}
 
 class FakeReservationClient final : public IReservationClient {
   public:
-    explicit FakeReservationClient(CallLog& log) : log_(log) {}
+    FakeReservationClient(CallLog& log, const Failing& failing) : log_(log), failing_(failing) {}
 
     userver::formats::json::Value ListHotels([[maybe_unused]] int page,
                                              [[maybe_unused]] int size) const override {
@@ -47,6 +56,7 @@ class FakeReservationClient final : public IReservationClient {
     Reservation CreateReservation([[maybe_unused]] const std::string& username,
                                   const NewReservation& new_reservation) const override {
         log_.emplace_back("CreateReservation");
+        ThrowIfFailing(failing_, "CreateReservation", "Reservation");
         created = new_reservation;
         Reservation result;
         result.reservation_uid = kReservationUid;
@@ -61,6 +71,7 @@ class FakeReservationClient final : public IReservationClient {
     void CancelReservation([[maybe_unused]] const std::string& username,
                            [[maybe_unused]] const std::string& reservation_uid) const override {
         log_.emplace_back("CancelReservation");
+        ThrowIfFailing(failing_, "CancelReservation", "Reservation");
     }
 
     std::optional<Hotel> hotel = Hotel{.hotel_uid = std::string{kHotelUid}, .price = 10000};
@@ -69,49 +80,76 @@ class FakeReservationClient final : public IReservationClient {
 
   private:
     CallLog& log_;
+    const Failing& failing_;
 };
 
 class FakePaymentClient final : public IPaymentClient {
   public:
-    explicit FakePaymentClient(CallLog& log) : log_(log) {}
+    FakePaymentClient(CallLog& log, const Failing& failing) : log_(log), failing_(failing) {}
 
     Payment CreatePayment(std::int64_t price) const override {
         log_.emplace_back("CreatePayment");
         return Payment{.payment_uid = std::string{kPaymentUid}, .status = "PAID", .price = price};
     }
 
-    std::optional<Payment>
-    GetPayment([[maybe_unused]] const std::string& payment_uid) const override {
-        return std::nullopt;
+    std::optional<Payment> GetPayment(const std::string& payment_uid) const override {
+        ThrowIfFailing(failing_, "GetPayment", "Payment");
+        return Payment{.payment_uid = payment_uid, .status = "PAID", .price = 27000};
     }
 
     void CancelPayment(const std::string& payment_uid) const override {
         log_.push_back("CancelPayment " + payment_uid);
+        ThrowIfFailing(failing_, "CancelPayment", "Payment");
     }
 
   private:
     CallLog& log_;
+    const Failing& failing_;
 };
 
 class FakeLoyaltyClient final : public ILoyaltyClient {
   public:
-    explicit FakeLoyaltyClient(CallLog& log) : log_(log) {}
+    FakeLoyaltyClient(CallLog& log, const Failing& failing) : log_(log), failing_(failing) {}
 
     Loyalty GetLoyalty([[maybe_unused]] const std::string& username) const override {
         log_.emplace_back("GetLoyalty");
+        ThrowIfFailing(failing_, "GetLoyalty", "Loyalty");
         return Loyalty{.status = "GOLD", .discount = 10, .reservation_count = 25};
     }
 
     void Increment([[maybe_unused]] const std::string& username) const override {
         log_.emplace_back("Increment");
+        ThrowIfFailing(failing_, "Increment", "Loyalty");
     }
 
     void Decrement([[maybe_unused]] const std::string& username) const override {
         log_.emplace_back("Decrement");
+        ThrowIfFailing(failing_, "Decrement", "Loyalty");
     }
 
   private:
     CallLog& log_;
+    const Failing& failing_;
+};
+
+class FakeRetryQueue final : public IRetryQueue {
+  public:
+    void Push(Job job) override { jobs.push_back(std::move(job)); }
+
+    // One retry round: jobs that fail with ServiceUnavailable stay in the queue.
+    void RetryAll() {
+        std::vector<Job> failed;
+        for (auto& job : jobs) {
+            try {
+                job();
+            } catch (const ServiceUnavailable&) {
+                failed.push_back(std::move(job));
+            }
+        }
+        jobs = std::move(failed);
+    }
+
+    std::vector<Job> jobs;
 };
 
 class BookingServiceTest : public ::testing::Test {
@@ -132,11 +170,22 @@ class BookingServiceTest : public ::testing::Test {
         return reservation;
     }
 
+    void BookExpectingUnavailable(std::string_view message) {
+        try {
+            service_.Book(std::string{kUser}, Request("2021-10-08", "2021-10-11"));
+            FAIL() << "ServiceUnavailable expected";
+        } catch (const ServiceUnavailable& e) {
+            EXPECT_STREQ(e.what(), std::string{message}.c_str());
+        }
+    }
+
     CallLog log_;
-    FakeReservationClient reservations_{log_};
-    FakePaymentClient payments_{log_};
-    FakeLoyaltyClient loyalty_{log_};
-    BookingService service_{reservations_, payments_, loyalty_};
+    Failing failing_;
+    FakeReservationClient reservations_{log_, failing_};
+    FakePaymentClient payments_{log_, failing_};
+    FakeLoyaltyClient loyalty_{log_, failing_};
+    FakeRetryQueue retries_;
+    BookingService service_{reservations_, payments_, loyalty_, retries_};
 };
 
 }
@@ -207,6 +256,90 @@ TEST_F(BookingServiceTest, CancelOfCanceledReservationChangesNothing) {
 
     EXPECT_TRUE(service_.Cancel(std::string{kUser}, std::string{kReservationUid}));
     EXPECT_EQ(log_, CallLog{"GetReservation"});
+}
+
+TEST_F(BookingServiceTest, UserInfoFallsBackToEmptyLoyalty) {
+    failing_.insert("GetLoyalty");
+
+    EXPECT_EQ(service_.GetUserInfo(std::string{kUser}).loyalty, std::nullopt);
+}
+
+TEST_F(BookingServiceTest, ReservationFallsBackToEmptyPayment) {
+    reservations_.reservation = ExistingReservation("PAID");
+    const auto before = service_.GetReservation(std::string{kUser}, std::string{kReservationUid});
+    ASSERT_TRUE(before && before->payment);
+
+    failing_.insert("GetPayment");
+    const auto view = service_.GetReservation(std::string{kUser}, std::string{kReservationUid});
+    if (!view) {
+        FAIL() << "reservation expected";
+    }
+    EXPECT_EQ(view->reservation.reservation_uid, kReservationUid);
+    EXPECT_EQ(view->payment, std::nullopt);
+}
+
+TEST_F(BookingServiceTest, LoyaltyIsCriticalForLoyaltyRequest) {
+    failing_.insert("GetLoyalty");
+
+    EXPECT_THROW(service_.GetLoyalty(std::string{kUser}), ServiceUnavailable);
+}
+
+TEST_F(BookingServiceTest, BookWithoutLoyaltyFailsBeforePaying) {
+    failing_.insert("GetLoyalty");
+
+    BookExpectingUnavailable("Loyalty Service unavailable");
+    EXPECT_EQ(log_, (CallLog{"GetHotel", "GetLoyalty"}));
+}
+
+TEST_F(BookingServiceTest, BookRollsBackPaymentWhenReservationFails) {
+    failing_.insert("CreateReservation");
+
+    BookExpectingUnavailable("Reservation Service unavailable");
+    EXPECT_EQ(log_, (CallLog{"GetHotel", "GetLoyalty", "CreatePayment", "CreateReservation",
+                             "CancelPayment " + std::string{kPaymentUid}}));
+    EXPECT_TRUE(retries_.jobs.empty());
+}
+
+TEST_F(BookingServiceTest, BookRollsBackReservationAndPaymentWhenIncrementFails) {
+    failing_.insert("Increment");
+
+    BookExpectingUnavailable("Loyalty Service unavailable");
+    EXPECT_EQ(log_,
+              (CallLog{"GetHotel", "GetLoyalty", "CreatePayment", "CreateReservation", "Increment",
+                       "CancelReservation", "CancelPayment " + std::string{kPaymentUid}}));
+    EXPECT_TRUE(retries_.jobs.empty());
+}
+
+TEST_F(BookingServiceTest, BookQueuesRollbackThatCannotReachItsService) {
+    failing_ = {"Increment", "CancelPayment"};
+
+    BookExpectingUnavailable("Loyalty Service unavailable");
+    ASSERT_EQ(retries_.jobs.size(), 1);
+
+    failing_.clear();
+    log_.clear();
+    retries_.RetryAll();
+    EXPECT_EQ(log_, CallLog{"CancelPayment " + std::string{kPaymentUid}});
+    EXPECT_TRUE(retries_.jobs.empty());
+}
+
+TEST_F(BookingServiceTest, CancelQueuesDecrementWhileLoyaltyIsUnavailable) {
+    reservations_.reservation = ExistingReservation("PAID");
+    failing_.insert("Decrement");
+
+    EXPECT_TRUE(service_.Cancel(std::string{kUser}, std::string{kReservationUid}));
+    EXPECT_EQ(log_, (CallLog{"GetReservation", "CancelReservation",
+                             "CancelPayment " + std::string{kPaymentUid}, "Decrement"}));
+    ASSERT_EQ(retries_.jobs.size(), 1);
+
+    retries_.RetryAll();
+    ASSERT_EQ(retries_.jobs.size(), 1);
+
+    failing_.clear();
+    log_.clear();
+    retries_.RetryAll();
+    EXPECT_EQ(log_, CallLog{"Decrement"});
+    EXPECT_TRUE(retries_.jobs.empty());
 }
 
 TEST_F(BookingServiceTest, CancelOfMissingReservationIsNotFound) {

@@ -8,6 +8,7 @@
 #include <userver/yaml_config/schema.hpp>
 
 #include "clients/http_clients.hpp"
+#include "clients/retry_queue.hpp"
 #include "domain/booking_service.hpp"
 
 namespace gateway {
@@ -27,6 +28,8 @@ class BookingComponent final : public userver::components::ComponentBase {
     ReservationClient reservations_;
     PaymentClient payments_;
     LoyaltyClient loyalty_;
+    // After the clients: queued jobs call them, so the queue is stopped first.
+    RetryQueue retries_;
     BookingService service_;
 };
 

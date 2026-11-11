@@ -20,6 +20,9 @@ std::chrono::milliseconds GetTimeout(const userver::components::ComponentConfig&
     return std::chrono::milliseconds{config["request-timeout-ms"].As<std::int64_t>()};
 }
 
+// How often the queued requests are retried.
+constexpr std::chrono::seconds kRetryInterval{10};
+
 }
 
 BookingComponent::BookingComponent(const userver::components::ComponentConfig& config,
@@ -30,7 +33,7 @@ BookingComponent::BookingComponent(const userver::components::ComponentConfig& c
       payments_(GetHttpClient(context), config["payment-url"].As<std::string>(),
                 GetTimeout(config)),
       loyalty_(GetHttpClient(context), config["loyalty-url"].As<std::string>(), GetTimeout(config)),
-      service_(reservations_, payments_, loyalty_) {}
+      retries_(kRetryInterval), service_(reservations_, payments_, loyalty_, retries_) {}
 
 userver::yaml_config::Schema BookingComponent::GetStaticConfigSchema() {
     return userver::yaml_config::MergeSchemas<ComponentBase>(R"(

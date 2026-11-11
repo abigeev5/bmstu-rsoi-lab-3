@@ -5,6 +5,7 @@
 
 #include <userver/clients/http/client.hpp>
 
+#include "clients/circuit_breaker.hpp"
 #include "domain/clients.hpp"
 
 namespace gateway {
@@ -28,6 +29,7 @@ class ReservationClient final : public IReservationClient {
     userver::clients::http::Client& http_;
     std::string base_url_;
     std::chrono::milliseconds timeout_;
+    mutable CircuitBreaker breaker_;
 };
 
 class PaymentClient final : public IPaymentClient {
@@ -43,6 +45,7 @@ class PaymentClient final : public IPaymentClient {
     userver::clients::http::Client& http_;
     std::string base_url_;
     std::chrono::milliseconds timeout_;
+    mutable CircuitBreaker breaker_;
 };
 
 class LoyaltyClient final : public ILoyaltyClient {
@@ -58,6 +61,7 @@ class LoyaltyClient final : public ILoyaltyClient {
     userver::clients::http::Client& http_;
     std::string base_url_;
     std::chrono::milliseconds timeout_;
+    mutable CircuitBreaker breaker_;
 };
 
 }

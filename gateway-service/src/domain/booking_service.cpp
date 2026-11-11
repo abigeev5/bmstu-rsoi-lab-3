@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <utility>
 
+#include <userver/logging/log.hpp>
+
 #include "common/http.hpp"
 
 namespace gateway {
@@ -49,18 +51,23 @@ std::int64_t CalcPrice(std::int64_t price_per_night, std::int64_t nights, int di
 }
 
 BookingService::BookingService(const IReservationClient& reservations,
-                               const IPaymentClient& payments, const ILoyaltyClient& loyalty)
-    : reservations_(reservations), payments_(payments), loyalty_(loyalty) {}
+                               const IPaymentClient& payments, const ILoyaltyClient& loyalty,
+                               IRetryQueue& retries)
+    : reservations_(reservations), payments_(payments), loyalty_(loyalty), retries_(retries) {}
 
 userver::formats::json::Value BookingService::ListHotels(int page, int size) const {
     return reservations_.ListHotels(page, size);
 }
 
 UserInfo BookingService::GetUserInfo(const std::string& username) const {
-    return UserInfo{
-        .reservations = GetReservations(username),
-        .loyalty = loyalty_.GetLoyalty(username),
-    };
+    UserInfo info{.reservations = GetReservations(username), .loyalty = std::nullopt};
+    try {
+        info.loyalty = loyalty_.GetLoyalty(username);
+    } catch (const ServiceUnavailable& e) {
+        // Loyalty is not critical here: the user still gets the reservations.
+        LOG_INFO() << e.what() << ", answering without loyalty";
+    }
+    return info;
 }
 
 std::vector<ReservationView> BookingService::GetReservations(const std::string& username) const {
@@ -108,14 +115,37 @@ BookingResult BookingService::Book(const std::string& username,
     const auto nights = (*end - *start).count();
     const auto discount = loyalty_.GetLoyalty(username).discount;
     auto payment = payments_.CreatePayment(CalcPrice(hotel->price, nights, discount));
-    auto reservation =
-        reservations_.CreateReservation(username, NewReservation{
-                                                      .hotel_uid = request.hotel_uid,
-                                                      .start_date = request.start_date,
-                                                      .end_date = request.end_date,
-                                                      .payment_uid = payment.payment_uid,
-                                                  });
-    loyalty_.Increment(username);
+
+    // Booking changes three services. If a later step fails, the earlier ones are undone
+    // (an undo that cannot reach its service goes to the retry queue) and the error is reported.
+    const auto undo_payment = [&] {
+        NowOrLater([&payments = payments_, payment_uid = payment.payment_uid] {
+            payments.CancelPayment(payment_uid);
+        });
+    };
+    Reservation reservation;
+    try {
+        reservation =
+            reservations_.CreateReservation(username, NewReservation{
+                                                          .hotel_uid = request.hotel_uid,
+                                                          .start_date = request.start_date,
+                                                          .end_date = request.end_date,
+                                                          .payment_uid = payment.payment_uid,
+                                                      });
+    } catch (...) {
+        undo_payment();
+        throw;
+    }
+    try {
+        loyalty_.Increment(username);
+    } catch (...) {
+        NowOrLater([&reservations = reservations_, username,
+                    reservation_uid = reservation.reservation_uid] {
+            reservations.CancelReservation(username, reservation_uid);
+        });
+        undo_payment();
+        throw;
+    }
 
     return BookingResult{
         .reservation = std::move(reservation),
@@ -137,7 +167,9 @@ bool BookingService::Cancel(const std::string& username, const std::string& rese
     }
     reservations_.CancelReservation(username, reservation_uid);
     payments_.CancelPayment(reservation->payment_uid);
-    loyalty_.Decrement(username);
+    // The cancellation is done for the user even if Loyalty Service is down now:
+    // the counter is decremented later from the retry queue.
+    NowOrLater([&loyalty = loyalty_, username] { loyalty.Decrement(username); });
     return true;
 }
 
@@ -145,8 +177,23 @@ Loyalty BookingService::GetLoyalty(const std::string& username) const {
     return loyalty_.GetLoyalty(username);
 }
 
+void BookingService::NowOrLater(const IRetryQueue::Job& job) const {
+    try {
+        job();
+    } catch (const ServiceUnavailable& e) {
+        LOG_WARNING() << e.what() << ", the request is queued for retry";
+        retries_.Push(job);
+    }
+}
+
 ReservationView BookingService::WithPayment(Reservation reservation) const {
-    auto payment = payments_.GetPayment(reservation.payment_uid);
+    std::optional<Payment> payment;
+    try {
+        payment = payments_.GetPayment(reservation.payment_uid);
+    } catch (const ServiceUnavailable& e) {
+        // Payment is not critical here: the reservation is returned without it.
+        LOG_INFO() << e.what() << ", answering without payment";
+    }
     return ReservationView{
         .reservation = std::move(reservation),
         .payment = std::move(payment),

@@ -2,7 +2,9 @@
 
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <userver/formats/json/value.hpp>
@@ -10,6 +12,14 @@
 #include "domain/models.hpp"
 
 namespace gateway {
+
+// Thrown by a client when its service did not answer, answered with 5xx,
+// or its circuit breaker is open. `service` is e.g. "Loyalty".
+class ServiceUnavailable : public std::runtime_error {
+  public:
+    explicit ServiceUnavailable(std::string_view service)
+        : std::runtime_error(std::string{service} + " Service unavailable") {}
+};
 
 class IReservationClient {
   public:

@@ -11,6 +11,7 @@
 #include <userver/formats/json/value.hpp>
 
 #include "domain/clients.hpp"
+#include "domain/retry_queue.hpp"
 
 namespace gateway {
 
@@ -28,12 +29,14 @@ struct BookingResult {
 
 struct ReservationView {
     Reservation reservation;
+    // Empty when Payment Service is unavailable (fallback) or does not know the payment.
     std::optional<Payment> payment;
 };
 
 struct UserInfo {
     std::vector<ReservationView> reservations;
-    Loyalty loyalty;
+    // Empty when Loyalty Service is unavailable (fallback).
+    std::optional<Loyalty> loyalty;
 };
 
 class ValidationError : public std::runtime_error {
@@ -53,7 +56,7 @@ std::int64_t CalcPrice(std::int64_t price_per_night, std::int64_t nights, int di
 class BookingService {
   public:
     BookingService(const IReservationClient& reservations, const IPaymentClient& payments,
-                   const ILoyaltyClient& loyalty);
+                   const ILoyaltyClient& loyalty, IRetryQueue& retries);
 
     userver::formats::json::Value ListHotels(int page, int size) const;
     UserInfo GetUserInfo(const std::string& username) const;
@@ -66,10 +69,13 @@ class BookingService {
 
   private:
     ReservationView WithPayment(Reservation reservation) const;
+    // Runs `job` now; if the service is unavailable, puts it into the retry queue.
+    void NowOrLater(const IRetryQueue::Job& job) const;
 
     const IReservationClient& reservations_;
     const IPaymentClient& payments_;
     const ILoyaltyClient& loyalty_;
+    IRetryQueue& retries_;
 };
 
 }

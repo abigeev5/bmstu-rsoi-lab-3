@@ -1,7 +1,9 @@
 add_library(gateway-service-lib STATIC
     src/api/handlers.cpp
     src/booking_component.cpp
+    src/clients/circuit_breaker.cpp
     src/clients/http_clients.cpp
+    src/clients/retry_queue.cpp
     src/domain/booking_service.cpp)
 target_include_directories(gateway-service-lib PUBLIC src)
 target_link_libraries(gateway-service-lib PUBLIC userver::core rsoi-common)

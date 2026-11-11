@@ -44,9 +44,8 @@ ValueBuilder ReservationToJson(const ReservationView& view) {
     json["startDate"] = reservation.start_date;
     json["endDate"] = reservation.end_date;
     json["status"] = reservation.status;
-    if (view.payment) {
-        json["payment"] = PaymentToJson(*view.payment);
-    }
+    json["payment"] = view.payment ? PaymentToJson(*view.payment)
+                                   : ValueBuilder{userver::formats::common::Type::kObject};
     return json;
 }
 
@@ -98,6 +97,16 @@ std::string ReservationNotFound(const HttpRequest& request) {
     return rsoi::ErrorResponse(request, HttpStatus::kNotFound, "Reservation not found");
 }
 
+// Runs `handle`; a service the response cannot do without is unavailable -> 503 with its name.
+template <typename Handle>
+std::string OrServiceUnavailable(const HttpRequest& request, const Handle& handle) {
+    try {
+        return handle();
+    } catch (const ServiceUnavailable& e) {
+        return rsoi::ErrorResponse(request, HttpStatus::kServiceUnavailable, e.what());
+    }
+}
+
 }
 
 HotelsHandler::HotelsHandler(const userver::components::ComponentConfig& config,
@@ -115,7 +124,9 @@ std::string HotelsHandler::HandleRequestThrow(
     if (!size || *size < 1 || *size > kMaxPageSize) {
         return ValidationErrorResponse(request, "size", "must be a number from 1 to 100");
     }
-    return rsoi::JsonResponse(request, service_.ListHotels(std::max(*page, 1), *size));
+    return OrServiceUnavailable(request, [&] {
+        return rsoi::JsonResponse(request, service_.ListHotels(std::max(*page, 1), *size));
+    });
 }
 
 MeHandler::MeHandler(const userver::components::ComponentConfig& config,
@@ -129,11 +140,14 @@ std::string MeHandler::HandleRequestThrow(
     if (username.empty()) {
         return MissingUserName(request);
     }
-    const auto info = service_.GetUserInfo(username);
-    ValueBuilder json;
-    json["reservations"] = ReservationsToJson(info.reservations);
-    json["loyalty"] = LoyaltyToJson(info.loyalty);
-    return rsoi::JsonResponse(request, json.ExtractValue());
+    return OrServiceUnavailable(request, [&] {
+        const auto info = service_.GetUserInfo(username);
+        ValueBuilder json;
+        json["reservations"] = ReservationsToJson(info.reservations);
+        json["loyalty"] = info.loyalty ? LoyaltyToJson(*info.loyalty)
+                                       : ValueBuilder{userver::formats::common::Type::kObject};
+        return rsoi::JsonResponse(request, json.ExtractValue());
+    });
 }
 
 ReservationsHandler::ReservationsHandler(const userver::components::ComponentConfig& config,
@@ -149,8 +163,10 @@ std::string ReservationsHandler::HandleRequestThrow(
     }
 
     if (request.GetMethod() == HttpMethod::kGet) {
-        return rsoi::JsonResponse(
-            request, ReservationsToJson(service_.GetReservations(username)).ExtractValue());
+        return OrServiceUnavailable(request, [&] {
+            return rsoi::JsonResponse(
+                request, ReservationsToJson(service_.GetReservations(username)).ExtractValue());
+        });
     }
 
     BookingRequest booking;
@@ -170,6 +186,8 @@ std::string ReservationsHandler::HandleRequestThrow(
                                   BookingToJson(service_.Book(username, booking)).ExtractValue());
     } catch (const ValidationError& e) {
         return ValidationErrorResponse(request, e.Field(), e.what());
+    } catch (const ServiceUnavailable& e) {
+        return rsoi::ErrorResponse(request, HttpStatus::kServiceUnavailable, e.what());
     }
 }
 
@@ -186,18 +204,20 @@ std::string ReservationHandler::HandleRequestThrow(
     }
     const auto& reservation_uid = request.GetPathArg("reservationUid");
 
-    if (request.GetMethod() == HttpMethod::kDelete) {
-        if (!service_.Cancel(username, reservation_uid)) {
+    return OrServiceUnavailable(request, [&] {
+        if (request.GetMethod() == HttpMethod::kDelete) {
+            if (!service_.Cancel(username, reservation_uid)) {
+                return ReservationNotFound(request);
+            }
+            return rsoi::NoContentResponse(request);
+        }
+
+        const auto view = service_.GetReservation(username, reservation_uid);
+        if (!view) {
             return ReservationNotFound(request);
         }
-        return rsoi::NoContentResponse(request);
-    }
-
-    const auto view = service_.GetReservation(username, reservation_uid);
-    if (!view) {
-        return ReservationNotFound(request);
-    }
-    return rsoi::JsonResponse(request, ReservationToJson(*view).ExtractValue());
+        return rsoi::JsonResponse(request, ReservationToJson(*view).ExtractValue());
+    });
 }
 
 LoyaltyHandler::LoyaltyHandler(const userver::components::ComponentConfig& config,
@@ -211,7 +231,10 @@ std::string LoyaltyHandler::HandleRequestThrow(
     if (username.empty()) {
         return MissingUserName(request);
     }
-    return rsoi::JsonResponse(request, LoyaltyToJson(service_.GetLoyalty(username)).ExtractValue());
+    return OrServiceUnavailable(request, [&] {
+        return rsoi::JsonResponse(request,
+                                  LoyaltyToJson(service_.GetLoyalty(username)).ExtractValue());
+    });
 }
 
 }
