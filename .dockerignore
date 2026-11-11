@@ -1,0 +1,4 @@
+# The images only package the binaries built by CI (see Dockerfile); keep the context tiny.
+*
+!build/release/*-service/*-service
+!*-service/configs/
