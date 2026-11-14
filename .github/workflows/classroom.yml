@@ -9,7 +9,7 @@ on:
 jobs:
   build:
     name: Autograding
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v3
         with:
@@ -17,8 +17,55 @@ jobs:
 
       - uses: docker/setup-buildx-action@v2
 
-      # TODO build and run unit tests
+      - name: Install dependencies
+        run: |
+          # The runner has the PGDG repo with a newer libpq; userver needs libpq to match
+          # postgresql-server-dev-16 from Ubuntu, as in WSL and in the Docker image.
+          printf 'Package: libpq5 libpq-dev\nPin: release o=Ubuntu\nPin-Priority: 1001\n' \
+            | sudo tee /etc/apt/preferences.d/libpq-ubuntu
+          sudo apt-get update
+          sudo apt-get install -y --allow-downgrades --no-install-recommends $(cat deps/ubuntu-24.04.txt)
+          # scripts/test-script.sh calls newman directly
+          sudo npm install -g newman
 
+      - name: Check formatting
+        run: clang-format-20 --dry-run --Werror $(git ls-files '*.cpp' '*.hpp')
+
+      - name: Restore userver sources and ccache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cache/CPM
+            ~/.cache/ccache
+          key: build-${{ hashFiles('CMakeLists.txt', 'deps/ubuntu-24.04.txt') }}-${{ github.run_number }}
+          restore-keys: |
+            build-${{ hashFiles('CMakeLists.txt', 'deps/ubuntu-24.04.txt') }}-
+            build-
+
+      # One build instead of debug + release: userver takes ~20 min per preset without a warm cache.
+      # Sanitizers stay available locally via the `debug` preset.
+      - name: Build (with clang-tidy)
+        run: |
+          ccache -M 5G
+          cmake --preset release -DRSOI_CLANG_TIDY=ON
+          cmake --build --preset release
+          ccache -s
+
+      # Saved right after the build: the grading steps at the end may fail the job,
+      # and the post-job save of actions/cache would be skipped then.
+      - name: Save userver sources and ccache
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/CPM
+            ~/.cache/ccache
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: Run unit tests
+        run: ctest --preset release
+
+      # The images only package the release binaries built above (see Dockerfile)
       - name: Build images
         timeout-minutes: 10
         run: docker compose build
@@ -31,15 +78,17 @@ jobs:
         env:
           WAIT_PORTS: 8080,8070,8060,8050
 
-      # TODO setup variant, service and port
-
       - name: Run API Tests
         timeout-minutes: 5
         run: ./scripts/test-script.sh
         env:
-          VARIANT: <variant>
-          SERVICE_NAME: <your service name>
-          PORT_NUMBER: <port number>
+          VARIANT: v2
+          SERVICE_NAME: loyalty-service
+          PORT_NUMBER: 8050
+
+      - name: Show service logs
+        if: failure()
+        run: docker compose logs
 
       - uses: education/autograding@v1
         id: autograder

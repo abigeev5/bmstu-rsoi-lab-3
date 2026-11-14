@@ -1,0 +1,63 @@
+components_manager:
+    task_processors:
+        main-task-processor:
+            worker_threads: 4
+        fs-task-processor:
+            worker_threads: 1
+
+    default_task_processor: main-task-processor
+
+    components:
+        server:
+            listener:
+                port: 8070
+                task_processor: main-task-processor
+
+        logging:
+            fs-task-processor: fs-task-processor
+            loggers:
+                default:
+                    file_path: '@stderr'
+                    level: info
+                    overflow_behavior: discard
+
+        testsuite-support: {}
+
+        postgres-db:
+            dbconnection: $database-url
+            dbconnection#env: DATABASE_URL
+            dbconnection#fallback: postgresql://program:test@localhost:5432/reservations
+            blocking_task_processor: fs-task-processor
+            dns_resolver: getaddrinfo
+            sync-start: true
+            # The default `auto` mode polls Postgres every 2s and logs every query; a single instance doesn't need it.
+            connlimit_mode: manual
+
+        handler-ping:
+            path: /manage/health
+            method: GET
+            task_processor: main-task-processor
+            throttling_enabled: false
+            url_trailing_slash: strict-match
+
+        reservation-service: {}
+
+        handler-hotels:
+            path: /api/v1/hotels
+            method: GET
+            task_processor: main-task-processor
+
+        handler-hotel:
+            path: /api/v1/hotels/{hotelUid}
+            method: GET
+            task_processor: main-task-processor
+
+        handler-reservations:
+            path: /api/v1/reservations
+            method: GET,POST
+            task_processor: main-task-processor
+
+        handler-reservation:
+            path: /api/v1/reservations/{reservationUid}
+            method: GET,DELETE
+            task_processor: main-task-processor

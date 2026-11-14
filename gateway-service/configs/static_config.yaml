@@ -1,0 +1,76 @@
+components_manager:
+    task_processors:
+        main-task-processor:
+            worker_threads: 4
+        fs-task-processor:
+            worker_threads: 1
+
+    default_task_processor: main-task-processor
+
+    components:
+        server:
+            listener:
+                port: 8080
+                task_processor: main-task-processor
+
+        logging:
+            fs-task-processor: fs-task-processor
+            loggers:
+                default:
+                    file_path: '@stderr'
+                    level: info
+                    overflow_behavior: discard
+
+        handler-ping:
+            path: /manage/health
+            method: GET
+            task_processor: main-task-processor
+            throttling_enabled: false
+            url_trailing_slash: strict-match
+
+        testsuite-support: {}
+
+        http-client: {}
+
+        http-client-core:
+            fs-task-processor: fs-task-processor
+            dns_resolver: getaddrinfo
+
+        booking-service:
+            reservation-url: $reservation-url
+            reservation-url#env: RESERVATION_URL
+            reservation-url#fallback: http://localhost:8070
+            payment-url: $payment-url
+            payment-url#env: PAYMENT_URL
+            payment-url#fallback: http://localhost:8060
+            loyalty-url: $loyalty-url
+            loyalty-url#env: LOYALTY_URL
+            loyalty-url#fallback: http://localhost:8050
+            request-timeout-ms: $request-timeout-ms
+            request-timeout-ms#env: REQUEST_TIMEOUT_MS
+            request-timeout-ms#fallback: 2000
+
+        handler-hotels:
+            path: /api/v1/hotels
+            method: GET
+            task_processor: main-task-processor
+
+        handler-me:
+            path: /api/v1/me
+            method: GET
+            task_processor: main-task-processor
+
+        handler-reservations:
+            path: /api/v1/reservations
+            method: GET,POST
+            task_processor: main-task-processor
+
+        handler-reservation:
+            path: /api/v1/reservations/{reservationUid}
+            method: GET,DELETE
+            task_processor: main-task-processor
+
+        handler-loyalty:
+            path: /api/v1/loyalty
+            method: GET
+            task_processor: main-task-processor
