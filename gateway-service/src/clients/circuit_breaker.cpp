@@ -38,7 +38,7 @@ void CircuitBreaker::RecordFailure(Clock::time_point now) {
         if (stored_ < failures_.size()) {
             ++stored_;
         }
-        
+
         if (stored_ < failures_.size() || now - failures_[oldest_] >= failure_window_) {
             return;
         }
