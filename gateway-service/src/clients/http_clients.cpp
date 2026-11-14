@@ -1,6 +1,7 @@
 #include "clients/http_clients.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <memory>
 #include <string_view>
 #include <utility>
@@ -25,17 +26,14 @@ using userver::clients::http::HttpMethod;
 using userver::clients::http::Response;
 using userver::formats::json::Value;
 
-// After this many failed requests in a row the breaker opens...
-constexpr int kFailureThreshold = 3;
-// ...and lets a trial request through after this time.
+constexpr std::size_t kFailureThreshold = 3;
+constexpr std::chrono::seconds kFailureWindow{10};
 constexpr std::chrono::seconds kOpenDuration{10};
 
 constexpr std::string_view kReservation = "Reservation";
 constexpr std::string_view kPayment = "Payment";
 constexpr std::string_view kLoyalty = "Loyalty";
 
-// Sends a request through the service's circuit breaker. No answer, 5xx or an open breaker
-// end in ServiceUnavailable; any other response (4xx too) is returned to the caller.
 std::shared_ptr<Response> Perform(userver::clients::http::Client& http,
                                   std::chrono::milliseconds timeout, CircuitBreaker& breaker,
                                   std::string_view service, HttpMethod method, std::string url,
@@ -129,7 +127,7 @@ Loyalty ParseLoyalty(const Value& json) {
 ReservationClient::ReservationClient(userver::clients::http::Client& http, std::string base_url,
                                      std::chrono::milliseconds timeout)
     : http_(http), base_url_(std::move(base_url)), timeout_(timeout),
-      breaker_(kFailureThreshold, kOpenDuration) {}
+      breaker_(kFailureThreshold, kFailureWindow, kOpenDuration) {}
 
 Value ReservationClient::ListHotels(int page, int size) const {
     const auto url =
@@ -190,7 +188,7 @@ void ReservationClient::CancelReservation(const std::string& username,
 PaymentClient::PaymentClient(userver::clients::http::Client& http, std::string base_url,
                              std::chrono::milliseconds timeout)
     : http_(http), base_url_(std::move(base_url)), timeout_(timeout),
-      breaker_(kFailureThreshold, kOpenDuration) {}
+      breaker_(kFailureThreshold, kFailureWindow, kOpenDuration) {}
 
 Payment PaymentClient::CreatePayment(std::int64_t price) const {
     userver::formats::json::ValueBuilder body;
@@ -219,7 +217,7 @@ void PaymentClient::CancelPayment(const std::string& payment_uid) const {
 LoyaltyClient::LoyaltyClient(userver::clients::http::Client& http, std::string base_url,
                              std::chrono::milliseconds timeout)
     : http_(http), base_url_(std::move(base_url)), timeout_(timeout),
-      breaker_(kFailureThreshold, kOpenDuration) {}
+      breaker_(kFailureThreshold, kFailureWindow, kOpenDuration) {}
 
 Loyalty LoyaltyClient::GetLoyalty(const std::string& username) const {
     return ParseLoyalty(JsonBody(*Perform(http_, timeout_, breaker_, kLoyalty, HttpMethod::kGet,

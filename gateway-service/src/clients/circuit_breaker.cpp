@@ -2,8 +2,10 @@
 
 namespace gateway {
 
-CircuitBreaker::CircuitBreaker(int failure_threshold, Clock::duration open_duration)
-    : failure_threshold_(failure_threshold), open_duration_(open_duration) {}
+CircuitBreaker::CircuitBreaker(std::size_t failure_threshold, Clock::duration failure_window,
+                               Clock::duration open_duration)
+    : failure_window_(failure_window), open_duration_(open_duration), failures_(failure_threshold) {
+}
 
 bool CircuitBreaker::AllowRequest(Clock::time_point now) {
     const std::lock_guard lock(mutex_);
@@ -25,26 +27,30 @@ bool CircuitBreaker::AllowRequest(Clock::time_point now) {
 void CircuitBreaker::RecordSuccess() {
     const std::lock_guard lock(mutex_);
     state_ = State::kClosed;
-    failures_ = 0;
 }
 
 void CircuitBreaker::RecordFailure(Clock::time_point now) {
     const std::lock_guard lock(mutex_);
     switch (state_) {
     case State::kClosed:
-        if (++failures_ < failure_threshold_) {
+        failures_[oldest_] = now;
+        oldest_ = (oldest_ + 1) % failures_.size();
+        if (stored_ < failures_.size()) {
+            ++stored_;
+        }
+        
+        if (stored_ < failures_.size() || now - failures_[oldest_] >= failure_window_) {
             return;
         }
         break;
     case State::kHalfOpen:
         break;
     case State::kOpen:
-        // A request let through before the breaker opened: it is already open.
         return;
     }
     state_ = State::kOpen;
     opened_at_ = now;
-    failures_ = 0;
+    stored_ = 0;
 }
 
 }
